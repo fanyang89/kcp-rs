@@ -1,10 +1,35 @@
 # kcp-rs
 
 Pure Rust implementation of the KCP reliable ordered transport protocol. The
-library has **no dependencies, no C/FFI, no unsafe code and no async runtime**.
-It uses `std` for owned buffers and queues.
+default library has **no dependencies, no C/FFI, no unsafe code and no async runtime**.
+It uses `std` for owned buffers and queues. An optional `async` feature adds only
+`futures-io` (no runtime) for connection/stream handles.
 
-## Model
+## Connections and asynchronous streams
+
+`endpoint::EndpointCore` adds bounded connection management, handshake retries,
+session routing, timeouts and reliable half-close without asynchronous dependencies.
+Enable `async` for `asynchronous::{Endpoint, KcpStream, Driver}` and
+`futures_io::AsyncRead` / `AsyncWrite`. Supply a datagram transport and timer and
+run the driver concurrently; the library never spawns tasks itself.
+
+```toml
+[dependencies]
+kcp-rs = { path = "../kcp-rs", features = ["async"] }
+```
+
+```sh
+cargo run --features async --example tokio
+cargo run --features async --example async_io
+```
+
+Both adapters use the same stream API and verify a 256 KiB UDP transfer and
+bidirectional half-close. Runtimes are dev/example dependencies only.
+See [sessions and async integration](docs/sessions.md) for budgets, lifecycle,
+wire format, cancellation and security limitations. The new session protocol
+requires matching peers; it does not interoperate with bare KCP or kcp-sys endpoints.
+
+## Bare KCP model
 
 `Kcp` is one conversation's Sans-I/O state machine:
 
@@ -88,7 +113,9 @@ endpoint/connection protocol.
 ```sh
 cargo test
 cargo test --release
-cargo clippy --all-targets -- -D warnings
+cargo test --all-features
+cargo test --all-features --release
+cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 

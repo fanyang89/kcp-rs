@@ -3,6 +3,10 @@
 #![forbid(unsafe_code)]
 #![doc = include_str!("../README.md")]
 
+#[cfg(feature = "async")]
+pub mod asynchronous;
+pub mod endpoint;
+
 use std::collections::VecDeque;
 
 const HEADER: usize = 24;

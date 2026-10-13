@@ -5,4 +5,22 @@ edition = "2024"
 description = "Pure Rust, runtime-independent KCP protocol implementation"
 license = "MIT"
 
+[features]
+default = []
+async = ["dep:futures-io"]
+
 [dependencies]
+futures-io = { version = "0.3", optional = true }
+
+[dev-dependencies]
+async-io = "2"
+futures-lite = "2"
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+
+[[example]]
+name = "tokio"
+required-features = ["async"]
+
+[[example]]
+name = "async_io"
+required-features = ["async"]
