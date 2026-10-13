@@ -387,3 +387,52 @@ fn multiplexed_connections_make_progress_with_a_small_output_queue() {
     messages.sort();
     assert_eq!(messages, (0..10).map(|i| vec![i; 100]).collect::<Vec<_>>());
 }
+
+#[test]
+fn readiness_tracks_data_capacity_eof_and_errors() {
+    let mut p = Pair::new();
+    let (a, b) = p.connect(false);
+    assert!(!p.a.is_readable(a).unwrap());
+    assert!(p.a.is_writable(a).unwrap());
+    assert!(!p.b.has_pending_accept());
+    for _ in 0..config().send_capacity {
+        assert_eq!(p.a.write(a, b"x").unwrap(), Some(1));
+    }
+    assert!(!p.a.is_writable(a).unwrap());
+    for _ in 0..100 {
+        p.step(false);
+        if p.b.is_readable(b).unwrap() && p.a.is_flushed(a).unwrap() {
+            break;
+        }
+    }
+    assert!(p.b.is_readable(b).unwrap());
+    assert!(p.a.is_writable(a).unwrap());
+    let mut data = [0; 8];
+    assert_eq!(p.b.read(b, &mut data).unwrap(), Some(8));
+    assert!(!p.b.is_readable(b).unwrap());
+    assert!(p.a.close_write(a).unwrap());
+    assert_eq!(
+        p.a.is_writable(a).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    for _ in 0..100 {
+        p.step(false);
+        if p.b.is_readable(b).unwrap() {
+            break;
+        }
+    }
+    assert!(p.b.is_readable(b).unwrap());
+    assert_eq!(p.b.read(b, &mut data).unwrap(), Some(0));
+    p.a.abort(a);
+    for _ in 0..10 {
+        p.step(false);
+    }
+    assert_eq!(
+        p.b.is_readable(b).unwrap_err().kind(),
+        io::ErrorKind::ConnectionReset
+    );
+    assert_eq!(
+        p.b.is_writable(b).unwrap_err().kind(),
+        io::ErrorKind::ConnectionReset
+    );
+}

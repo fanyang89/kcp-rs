@@ -4,7 +4,7 @@
 
 - `Kcp`: bare KCP, retaining the original wire compatibility and zero dependencies.
 - `endpoint::EndpointCore`: synchronous session manager, also zero dependencies.
-- `asynchronous::{Endpoint, KcpStream, Driver}`: optional `async` feature, depending
+- `asynchronous::{Endpoint, Connector, KcpStream, Driver}`: optional `async` feature, depending
   only on `futures-io` for the standard runtime-neutral I/O traits.
 - `DatagramTransport` and `Timer`: adapters supplied by the application. Runnable
   examples provide Tokio and async-io implementations; neither is a normal library
@@ -19,8 +19,12 @@ Stream operations copy bounded data into/out of core buffers. There is no additi
 unbounded command channel and no lock held across an await or transport operation.
 Condition checks and waker registration use the same lock. Wakers are invoked
 only after unlocking. The driver processes at most 64 I/O iterations per poll,
-then yields cooperatively. Stream wakeups currently scan the registered handles;
-this initial implementation favors simplicity over large-endpoint throughput.
+then yields cooperatively. The driver scans registered handles but wakes only
+operations that can now progress (or return an error). Read, write, flush, close,
+connect and accept readiness are tracked separately: free send capacity alone is
+not a reason to wake a flush waiting for acknowledgements. This initial version
+still favors simplicity over large-endpoint throughput; it does not use an
+incremental readiness index.
 
 The driver needs only datagrams and monotonic timers, not an executor/spawner
 abstraction. Adapters may be `Send` or local-only; the driver is `Send` when its
@@ -32,17 +36,39 @@ A successful send means the entire datagram was accepted by the transport.
 
 ```text
 Endpoint::new(config, session_seed, transport, timer) -> (Endpoint, Driver)
+Endpoint::connector()                                -> Connector (Clone)
+Connector::connect(peer).await                        -> KcpStream
 Endpoint::connect(peer).await                         -> KcpStream
 Endpoint::accept().await                              -> KcpStream
 KcpStream: futures_io::AsyncRead + futures_io::AsyncWrite
 ```
 
-`Endpoint` is intentionally not Clone. `connect` and `accept` borrow it mutably,
-so one such operation can be pending per handle. Existing streams run independently
-and can be moved into separate application tasks. Dropping the endpoint disables
-new inbound handshakes but does not terminate existing streams. Applications
-needing simultaneous inbound/outbound opens can use `EndpointCore` directly;
-a multi-listener/connector facade is not included in this first version.
+`Endpoint` owns the listener and is intentionally not Clone. `accept` borrows it
+mutably, allowing one pending accept per listener. `connect` borrows it immutably;
+for simultaneous inbound/outbound opens, first obtain a `Connector` with
+`endpoint.connector()`. Connector is Clone and its `connect` takes `&self`, so
+multiple connection attempts may run concurrently, including from different tasks.
+Each attempt has its own connection ID, waker and cancellation cleanup.
+
+Existing streams and connectors live independently of the listener. Dropping the
+endpoint disables new inbound handshakes but does not terminate streams or prevent
+connectors from initiating new connections. Dropping a connector does not disable
+listening or affect other clones. All handles still require a running driver;
+once it exits, both existing operations and new connection attempts fail.
+
+For example, using an application-provided futures combinator while the driver
+runs concurrently:
+
+```rust
+let connector = endpoint.connector();
+let (outgoing, incoming) = futures_lite::future::zip(
+    connector.connect(remote_addr),
+    endpoint.accept(),
+).await;
+```
+
+`futures-lite` here is an application choice, not a library dependency. Clone a
+Connector to move it into another task without transferring listener ownership.
 
 - Writes may be partial, and return Pending when the configured send budget is full.
 - Flush waits for all previously accepted records to be ACKed by the peer's KCP.
@@ -180,6 +206,7 @@ Both examples transfer 256 KiB over real loopback UDP, verify the bytes, half-cl
 and exchange a response. They use the same stream API and differ only in UDP/timer
 adapters and executor. Deterministic tests additionally exercise each lost handshake
 leg, loss/reordering/duplication, multiple connections, backpressure, FIN ordering,
-lingering cleanup, malformed input, timeout/reset, cancellation and wakeup/driver
+lingering cleanup, malformed input, timeout/reset, concurrent bidirectional opens,
+connector/listener ownership, cancellation, readiness-specific wakeups and driver
 shutdown behavior. Tokio users wanting Tokio I/O traits can wrap a KcpStream with
 `tokio-util::compat::FuturesAsyncReadCompatExt::compat()` in their own application.

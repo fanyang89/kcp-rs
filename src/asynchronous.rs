@@ -41,6 +41,7 @@ pub trait Timer {
 struct Waiters {
     read: Option<Waker>,
     write: Option<Waker>,
+    flush: Option<Waker>,
     connect: Option<Waker>,
     close: Option<Waker>,
 }
@@ -57,22 +58,47 @@ impl Shared {
     }
     fn notifications(&mut self) -> Vec<Waker> {
         let mut out = Vec::new();
-        if let Some(w) = self.accept.take() {
-            out.push(w);
-        }
-        for waiter in self.waiters.values_mut() {
-            for slot in [
+        let stopped = self.stopped.is_some();
+        take_ready(
+            &mut self.accept,
+            stopped || self.core.has_pending_accept(),
+            &mut out,
+        );
+        for (&id, waiter) in &mut self.waiters {
+            // Errors are readiness too: the next poll must observe the failure.
+            take_ready(
                 &mut waiter.read,
+                stopped || self.core.is_readable(id).unwrap_or(true),
+                &mut out,
+            );
+            take_ready(
                 &mut waiter.write,
+                stopped || self.core.is_writable(id).unwrap_or(true),
+                &mut out,
+            );
+            take_ready(
+                &mut waiter.flush,
+                stopped || self.core.is_flushed(id).unwrap_or(true),
+                &mut out,
+            );
+            take_ready(
                 &mut waiter.connect,
-                &mut waiter.close,
-            ] {
-                if let Some(w) = slot.take() {
-                    out.push(w);
-                }
-            }
+                stopped || self.core.is_connected(id).unwrap_or(true),
+                &mut out,
+            );
+            let close_ready = match self.core.is_write_closed(id) {
+                Ok(false) => self.core.is_writable(id).unwrap_or(true),
+                Ok(true) => self.core.is_flushed(id).unwrap_or(true),
+                Err(_) => true,
+            };
+            take_ready(&mut waiter.close, stopped || close_ready, &mut out);
         }
         out
+    }
+}
+fn take_ready(slot: &mut Option<Waker>, ready: bool, out: &mut Vec<Waker>) {
+    if ready && let Some(waker) = slot.take() {
+        out.push(waker);
     }
 }
 fn wake(wakers: impl IntoIterator<Item = Waker>) {
@@ -86,8 +112,8 @@ fn register(slot: &mut Option<Waker>, cx: &Context<'_>) {
     }
 }
 
-/// One listener/connector handle. Stream handles live independently of this handle.
-/// Only one connect/accept future may borrow this handle at a time.
+/// Listener and connection factory. Streams live independently of this handle.
+/// Use `connector()` to open connections concurrently with `accept()` or in other tasks.
 pub struct Endpoint {
     shared: Arc<Mutex<Shared>>,
 }
@@ -124,37 +150,16 @@ impl Endpoint {
             },
         ))
     }
-    /// Cancellation drops the embryonic stream and releases its connection slot.
-    pub async fn connect(&mut self, peer: SocketAddr) -> io::Result<KcpStream> {
-        let (id, waker) = {
-            let mut shared = self.shared.lock().unwrap();
-            shared.check()?;
-            // Driver updates the core's monotonic time before servicing the request.
-            let id = shared.core.connect_deferred(peer)?;
-            shared.waiters.insert(id, Waiters::default());
-            (id, shared.driver.take())
-        };
-        wake(waker);
-        let stream = KcpStream {
+    /// A clonable outgoing connection factory, independent of the listener's lifetime.
+    pub fn connector(&self) -> Connector {
+        Connector {
             shared: self.shared.clone(),
-            id,
-        };
-        poll_fn(|cx| {
-            let mut shared = stream.shared.lock().unwrap();
-            if let Err(e) = shared.check() {
-                return Poll::Ready(Err(e));
-            }
-            match shared.core.is_connected(id) {
-                Ok(true) => Poll::Ready(Ok(())),
-                Err(e) => Poll::Ready(Err(e)),
-                Ok(false) => {
-                    register(&mut shared.waiters.get_mut(&id).unwrap().connect, cx);
-                    Poll::Pending
-                }
-            }
-        })
-        .await?;
-        Ok(stream)
+        }
+    }
+    /// Connects without borrowing the endpoint mutably. For simultaneous accept/connect,
+    /// obtain a Connector first. Cancellation releases only this attempt's local slot.
+    pub async fn connect(&self, peer: SocketAddr) -> io::Result<KcpStream> {
+        self.connector().connect(peer).await
     }
     /// Cancellation does not remove a queued accepted connection.
     pub async fn accept(&mut self) -> io::Result<KcpStream> {
@@ -186,6 +191,47 @@ impl Drop for Endpoint {
             s.driver.take()
         };
         wake(w);
+    }
+}
+
+/// Clonable outgoing connection factory. Multiple connect futures may be pending
+/// concurrently. Cloning/dropping it does not change listener or stream ownership.
+#[derive(Clone)]
+pub struct Connector {
+    shared: Arc<Mutex<Shared>>,
+}
+impl Connector {
+    /// Cancellation drops the embryonic stream and releases its connection slot.
+    pub async fn connect(&self, peer: SocketAddr) -> io::Result<KcpStream> {
+        let (id, waker) = {
+            let mut shared = self.shared.lock().unwrap();
+            shared.check()?;
+            // Driver updates the core's monotonic time before servicing the request.
+            let id = shared.core.connect_deferred(peer)?;
+            shared.waiters.insert(id, Waiters::default());
+            (id, shared.driver.take())
+        };
+        wake(waker);
+        let stream = KcpStream {
+            shared: self.shared.clone(),
+            id,
+        };
+        poll_fn(|cx| {
+            let mut shared = stream.shared.lock().unwrap();
+            if let Err(e) = shared.check() {
+                return Poll::Ready(Err(e));
+            }
+            match shared.core.is_connected(id) {
+                Ok(true) => Poll::Ready(Ok(())),
+                Err(e) => Poll::Ready(Err(e)),
+                Ok(false) => {
+                    register(&mut shared.waiters.get_mut(&id).unwrap().connect, cx);
+                    Poll::Pending
+                }
+            }
+        })
+        .await?;
+        Ok(stream)
     }
 }
 
@@ -272,7 +318,7 @@ impl AsyncWrite for KcpStream {
             Err(e) => Poll::Ready(Err(e)),
             Ok(true) => Poll::Ready(Ok(())),
             Ok(false) => {
-                register(&mut s.waiters.get_mut(&self.id).unwrap().write, cx);
+                register(&mut s.waiters.get_mut(&self.id).unwrap().flush, cx);
                 Poll::Pending
             }
         }

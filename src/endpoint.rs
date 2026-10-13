@@ -228,6 +228,27 @@ impl EndpointCore {
             Phase::Established | Phase::Closed
         ))
     }
+    /// Whether a nonempty read can return data or EOF without waiting.
+    pub fn is_readable(&self, id: ConnectionId) -> io::Result<bool> {
+        let c = self.connection(id)?;
+        Ok(!c.receive.is_empty() || c.peer_closed)
+    }
+    /// Whether a nonempty write can accept bytes without waiting.
+    pub fn is_writable(&self, id: ConnectionId) -> io::Result<bool> {
+        let c = self.connection(id)?;
+        if c.write_closed {
+            return Err(error(io::ErrorKind::BrokenPipe));
+        }
+        Ok(c.phase == Phase::Established && c.kcp.waitsnd() < self.config.send_capacity)
+    }
+    /// Whether accept can return a live connection without waiting.
+    pub fn has_pending_accept(&self) -> bool {
+        self.accepts.iter().any(|id| {
+            self.connections
+                .get(id)
+                .is_some_and(|c| c.error.is_none() && !c.accepted)
+        })
+    }
     pub fn peer_addr(&self, id: ConnectionId) -> io::Result<SocketAddr> {
         Ok(self.connection(id)?.peer)
     }

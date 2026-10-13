@@ -366,3 +366,164 @@ fn dropping_driver_wakes_connect_write_flush_and_close() {
         Poll::Ready(Err(_))
     ));
 }
+
+#[test]
+fn idle_driver_does_not_wake_readers_or_acceptors() {
+    let mut p = Pair::new();
+    let (mut a, mut b) = p.streams();
+    let reader = Arc::new(Counter::default());
+    let acceptor = Arc::new(Counter::default());
+    let rw = Waker::from(reader.clone());
+    let aw = Waker::from(acceptor.clone());
+    let mut rcx = Context::from_waker(&rw);
+    let mut acx = Context::from_waker(&aw);
+    let mut driver_cx = Context::from_waker(Waker::noop());
+    assert!(
+        Pin::new(&mut a)
+            .poll_read(&mut rcx, &mut [0; 8])
+            .is_pending()
+    );
+    let mut accept = pin!(p.a.accept());
+    assert!(accept.as_mut().poll(&mut acx).is_pending());
+    for _ in 0..100 {
+        p.time.fetch_add(10, Ordering::SeqCst);
+        assert!(Pin::new(&mut p.da).poll(&mut driver_cx).is_pending());
+        assert!(Pin::new(&mut p.db).poll(&mut driver_cx).is_pending());
+    }
+    assert_eq!(reader.0.load(Ordering::SeqCst), 0);
+    assert_eq!(acceptor.0.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        Pin::new(&mut b).poll_write(&mut driver_cx, b"hello"),
+        Poll::Ready(Ok(5))
+    ));
+    for _ in 0..100 {
+        p.time.fetch_add(10, Ordering::SeqCst);
+        assert!(Pin::new(&mut p.da).poll(&mut driver_cx).is_pending());
+        assert!(Pin::new(&mut p.db).poll(&mut driver_cx).is_pending());
+        if reader.0.load(Ordering::SeqCst) != 0 {
+            break;
+        }
+    }
+    assert_eq!(reader.0.load(Ordering::SeqCst), 1);
+    assert_eq!(acceptor.0.load(Ordering::SeqCst), 0);
+    let mut buf = [0; 8];
+    assert!(matches!(
+        Pin::new(&mut a).poll_read(&mut rcx, &mut buf),
+        Poll::Ready(Ok(5))
+    ));
+    assert_eq!(&buf[..5], b"hello");
+}
+
+#[test]
+fn writable_capacity_does_not_spuriously_wake_flush() {
+    let mut p = Pair::new();
+    let (mut a, _b) = p.streams();
+    p.blocked.store(true, Ordering::SeqCst);
+    let counter = Arc::new(Counter::default());
+    let w = Waker::from(counter.clone());
+    let mut cx = Context::from_waker(&w);
+    assert!(matches!(
+        Pin::new(&mut a).poll_write(&mut cx, b"x"),
+        Poll::Ready(Ok(1))
+    ));
+    // One of two send slots is still available, but flush must wait for the ACK.
+    assert!(Pin::new(&mut a).poll_flush(&mut cx).is_pending());
+    for _ in 0..10 {
+        p.step();
+    }
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+    p.blocked.store(false, Ordering::SeqCst);
+    for _ in 0..100 {
+        p.step();
+        if counter.0.load(Ordering::SeqCst) != 0 {
+            break;
+        }
+    }
+    assert_eq!(counter.0.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        Pin::new(&mut a).poll_flush(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+}
+
+#[test]
+fn cloned_connectors_open_concurrently_with_bidirectional_accept() {
+    let mut p = Pair::new();
+    let ca = p.a.connector();
+    let ca2 = ca.clone();
+    let cb = p.b.connector();
+    let mut cx = Context::from_waker(Waker::noop());
+    // A cancelled attempt must not disturb other attempts on the same connector.
+    {
+        let mut cancelled = pin!(ca.connect(addr(2)));
+        assert!(cancelled.as_mut().poll(&mut cx).is_pending());
+    }
+    let mut operations = pin!(async {
+        let opens = futures_lite::future::zip(ca.connect(addr(2)), ca2.connect(addr(2)));
+        let accepts = async {
+            let a = p.a.accept().await.unwrap();
+            let b1 = p.b.accept().await.unwrap();
+            let b2 = p.b.accept().await.unwrap();
+            (a, b1, b2)
+        };
+        let ((a1, a2), (b, (accepted_a, accepted_b1, accepted_b2))) = futures_lite::future::zip(
+            opens,
+            futures_lite::future::zip(cb.connect(addr(1)), accepts),
+        )
+        .await;
+        (
+            a1.unwrap(),
+            a2.unwrap(),
+            b.unwrap(),
+            accepted_a,
+            accepted_b1,
+            accepted_b2,
+        )
+    });
+    for _ in 0..1000 {
+        if let Poll::Ready((a1, a2, b, accepted_a, accepted_b1, accepted_b2)) =
+            operations.as_mut().poll(&mut cx)
+        {
+            assert_ne!(a1.id(), a2.id());
+            assert_ne!(a1.id(), accepted_a.id());
+            assert_ne!(b.id(), accepted_b1.id());
+            assert_ne!(accepted_b1.id(), accepted_b2.id());
+            return;
+        }
+        p.time.fetch_add(10, Ordering::SeqCst);
+        assert!(Pin::new(&mut p.da).poll(&mut cx).is_pending());
+        assert!(Pin::new(&mut p.db).poll(&mut cx).is_pending());
+    }
+    panic!("concurrent connect/accept stalled");
+}
+
+#[test]
+fn connector_survives_listener_drop_and_observes_driver_drop() {
+    let mut p = Pair::new();
+    let connector = p.a.connector();
+    drop(p.a);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut connected = false;
+    {
+        let mut operations = pin!(futures_lite::future::zip(
+            connector.connect(addr(2)),
+            p.b.accept()
+        ));
+        for _ in 0..1000 {
+            if let Poll::Ready((a, b)) = operations.as_mut().poll(&mut cx) {
+                assert!(a.is_ok() && b.is_ok());
+                connected = true;
+                break;
+            }
+            p.time.fetch_add(10, Ordering::SeqCst);
+            assert!(Pin::new(&mut p.da).poll(&mut cx).is_pending());
+            assert!(Pin::new(&mut p.db).poll(&mut cx).is_pending());
+        }
+    }
+    assert!(connected);
+    drop(p.da);
+    let mut connection = pin!(connector.connect(addr(2)));
+    assert!(
+        matches!(connection.as_mut().poll(&mut cx), Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe)
+    );
+}

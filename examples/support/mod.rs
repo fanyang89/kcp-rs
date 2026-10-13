@@ -6,7 +6,7 @@ use kcp_rs::asynchronous::Endpoint;
 use std::{io, net::SocketAddr};
 
 pub async fn exchange(
-    mut client: Endpoint,
+    client: Endpoint,
     mut server: Endpoint,
     server_addr: SocketAddr,
 ) -> io::Result<()> {
