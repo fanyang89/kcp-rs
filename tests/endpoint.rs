@@ -591,3 +591,44 @@ fn keep_alive_configuration_requires_a_sensible_interval() {
         .is_ok()
     );
 }
+
+#[test]
+fn endpoint_shutdown_is_permanent_and_discards_all_protocol_queues() {
+    let mut p = Pair::new();
+    let (a, b) = p.connect(false);
+    p.a.write(a, b"pending send").unwrap();
+    p.b.write(b, b"pending read").unwrap();
+    for _ in 0..10 {
+        p.step(false);
+    }
+    assert!(p.a.is_readable(a).unwrap());
+    p.a.connect(addr(3), p.now).unwrap();
+    p.a.update(p.now);
+    p.a.shutdown();
+    p.a.shutdown();
+    assert!(p.a.is_shutdown());
+    assert_eq!(p.a.connection_count(), 0);
+    assert!(p.a.poll_transmit().is_none());
+    assert!(p.a.accept().is_none());
+    assert_eq!(p.a.deadline(), None);
+    assert_eq!(
+        p.a.read(a, &mut [0; 16]).unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    assert_eq!(
+        p.a.write(a, b"x").unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    assert_eq!(
+        p.a.connect(addr(2), p.now).unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    p.a.set_listening(true);
+    p.a.update(p.now + 10000);
+    assert_eq!(
+        p.a.input(addr(2), &[], p.now + 10000).unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+    assert_eq!(p.a.connection_count(), 0);
+    assert!(p.a.poll_transmit().is_none());
+}

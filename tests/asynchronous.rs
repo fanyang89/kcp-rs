@@ -560,3 +560,112 @@ fn keep_alive_is_invisible_to_pending_stream_reads() {
         Poll::Ready(Ok(11))
     ));
 }
+
+#[test]
+fn explicit_shutdown_wakes_all_operations_and_completes_driver() {
+    let mut p = Pair::new();
+    let (mut a, _b) = p.streams();
+    let control = p.a.connector();
+    let opener = control.clone();
+    let counter = Arc::new(Counter::default());
+    let w = Waker::from(counter.clone());
+    let mut cx = Context::from_waker(&w);
+    p.blocked.store(true, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(matches!(
+            Pin::new(&mut a).poll_write(&mut cx, b"x"),
+            Poll::Ready(Ok(1))
+        ));
+    }
+    assert!(Pin::new(&mut a).poll_write(&mut cx, b"x").is_pending());
+    assert!(Pin::new(&mut a).poll_flush(&mut cx).is_pending());
+    assert!(Pin::new(&mut a).poll_close(&mut cx).is_pending());
+    assert!(
+        Pin::new(&mut a)
+            .poll_read(&mut cx, &mut [0; 1])
+            .is_pending()
+    );
+    let mut accept = pin!(p.a.accept());
+    let mut connect = pin!(opener.connect(addr(2)));
+    assert!(accept.as_mut().poll(&mut cx).is_pending());
+    assert!(connect.as_mut().poll(&mut cx).is_pending());
+    assert!(Pin::new(&mut p.da).poll(&mut cx).is_pending());
+    counter.0.store(0, Ordering::SeqCst);
+    control.shutdown();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 7);
+    control.shutdown();
+    assert_eq!(counter.0.load(Ordering::SeqCst), 7);
+    assert!(
+        matches!(accept.as_mut().poll(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    assert!(
+        matches!(connect.as_mut().poll(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    assert!(
+        matches!(Pin::new(&mut a).poll_read(&mut cx,&mut[0;1]),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    assert!(
+        matches!(Pin::new(&mut a).poll_write(&mut cx,b"x"),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    assert!(
+        matches!(Pin::new(&mut a).poll_flush(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    assert!(
+        matches!(Pin::new(&mut a).poll_close(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    // A stopped driver must not poll the transport again, even if it would fail.
+    p.fail.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        Pin::new(&mut p.da).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+    drop(p.da);
+    assert!(
+        matches!(Pin::new(&mut a).poll_read(&mut cx,&mut[0;1]),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+}
+
+#[test]
+fn shutdown_before_first_driver_poll_rejects_new_connections() {
+    let mut p = Pair::new();
+    let connector = p.a.connector();
+    p.a.shutdown();
+    p.a.shutdown();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut connect = pin!(connector.connect(addr(2)));
+    assert!(
+        matches!(connect.as_mut().poll(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    let mut accept = pin!(p.a.accept());
+    assert!(
+        matches!(accept.as_mut().poll(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::ConnectionAborted)
+    );
+    assert!(matches!(
+        Pin::new(&mut p.da).poll(&mut cx),
+        Poll::Ready(Ok(()))
+    ));
+}
+
+#[test]
+fn shutdown_does_not_overwrite_an_earlier_transport_failure() {
+    let mut p = Pair::new();
+    let (mut a, _b) = p.streams();
+    let connector = p.a.connector();
+    let mut cx = Context::from_waker(Waker::noop());
+    p.fail.store(true, Ordering::SeqCst);
+    assert!(
+        matches!(Pin::new(&mut p.da).poll(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::NetworkDown)
+    );
+    connector.shutdown();
+    assert_eq!(
+        a.peer_addr().unwrap_err().kind(),
+        io::ErrorKind::NetworkDown
+    );
+    assert!(
+        matches!(Pin::new(&mut a).poll_read(&mut cx,&mut[0;1]),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::NetworkDown)
+    );
+    let mut connect = pin!(connector.connect(addr(2)));
+    assert!(
+        matches!(connect.as_mut().poll(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::NetworkDown)
+    );
+}

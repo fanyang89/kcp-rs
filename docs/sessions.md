@@ -40,6 +40,7 @@ Endpoint::connector()                                -> Connector (Clone)
 Connector::connect(peer).await                        -> KcpStream
 Endpoint::connect(peer).await                         -> KcpStream
 Endpoint::accept().await                              -> KcpStream
+Endpoint::shutdown() / Connector::shutdown()           -> immediate local shutdown
 KcpStream: futures_io::AsyncRead + futures_io::AsyncWrite
 ```
 
@@ -98,6 +99,38 @@ for close. `is_flushed` and `is_connected` report progress or terminal errors.
 A caller owns each returned ConnectionId until `release` or `abort`; terminal
 outgoing/accepted sessions retain a slot until released. Unaccepted failed sessions
 are reclaimed automatically.
+
+## Endpoint shutdown
+
+Call `Endpoint::shutdown()` or `Connector::shutdown()` to permanently stop the
+entire local endpoint. A Connector clone can initiate shutdown from another task,
+including while accept or connect is pending. The operation is synchronous,
+idempotent and runtime-neutral:
+
+- All pending and subsequent application operations fail with ConnectionAborted.
+- All connection state, KCP buffers, accept backlog and queued output are released
+  immediately, even if application stream handles are retained.
+- The driver is woken and completes with `Ok(())` when polled. It drops its own
+  pending datagram/receive buffer on completion. The transport/timer objects remain
+  owned by the driver until the driver future is dropped.
+- No FIN or RESET is sent; this is local cancellation, not a graceful delivery or
+  peer-notification guarantee. An already running transport poll may finish
+  concurrently with shutdown. Await driver completion before assuming no more I/O.
+- An earlier transport/timer failure or driver drop keeps its original error;
+  calling shutdown afterward cannot turn that failure into success.
+
+For graceful operation, close each stream, continue driving peer completion and
+allow the desired linger interval before shutting down the endpoint. Dropping
+just the Endpoint listener still only stops new inbound handshakes; use explicit
+shutdown when you intend to terminate all streams and outgoing Connector clones.
+
+`EndpointCore::shutdown()` provides the corresponding Sans-I/O operation. It
+releases all queues, sets `is_shutdown()`, rejects new input/connect operations
+with ConnectionAborted, and cannot be reversed by `set_listening(true)`. Its
+accept/transmit/deadline queries become empty. Construct a fresh endpoint to restart.
+
+Driver failure/drop also releases core buffers and waker registrations promptly;
+retaining errored stream handles does not retain their protocol queues.
 
 ## Scheduling and budgets
 
@@ -240,6 +273,6 @@ adapters and executor. Deterministic tests additionally exercise each lost hands
 leg, loss/reordering/duplication, multiple connections, backpressure, FIN ordering,
 lingering cleanup, malformed input, timeout/reset, concurrent bidirectional opens,
 connector/listener ownership, keepalive through loss/timestamp wrap, unanswered-probe
-expiry, detached cleanup, cancellation, readiness-specific wakeups and driver
-shutdown behavior. Tokio users wanting Tokio I/O traits can wrap a KcpStream with
+expiry, detached cleanup, cancellation, readiness-specific wakeups, explicit
+shutdown, first-error preservation and driver drop behavior. Tokio users wanting Tokio I/O traits can wrap a KcpStream with
 `tokio-util::compat::FuturesAsyncReadCompatExt::compat()` in their own application.

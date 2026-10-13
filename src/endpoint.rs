@@ -116,6 +116,7 @@ pub struct EndpointCore {
     next_id: Option<u64>,
     now: u64,
     output_cursor: Option<ConnectionId>,
+    shutdown: bool,
 }
 fn error(kind: io::ErrorKind) -> io::Error {
     io::Error::from(kind)
@@ -154,7 +155,21 @@ impl EndpointCore {
             next_id: Some(session_seed),
             now: 0,
             output_cursor: None,
+            shutdown: false,
         })
+    }
+    /// Permanently aborts this endpoint and releases all protocol queues. Idempotent.
+    /// No FIN/RESET is sent; use per-stream close before shutdown for graceful delivery.
+    pub fn shutdown(&mut self) {
+        self.shutdown = true;
+        self.config.listen = false;
+        self.connections.clear();
+        self.accepts = VecDeque::new();
+        self.output = VecDeque::new();
+        self.output_cursor = None;
+    }
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown
     }
     /// Most recent monotonic time supplied to the core.
     pub fn current_time(&self) -> u64 {
@@ -167,9 +182,12 @@ impl EndpointCore {
         self.connections.len()
     }
     pub fn set_listening(&mut self, enabled: bool) {
-        self.config.listen = enabled;
+        self.config.listen = enabled && !self.shutdown;
     }
     fn allocate(&mut self) -> io::Result<ConnectionId> {
+        if self.shutdown {
+            return Err(error(io::ErrorKind::ConnectionAborted));
+        }
         if self.connections.len() >= self.config.max_connections {
             return Err(error(io::ErrorKind::WouldBlock));
         }
@@ -180,6 +198,9 @@ impl EndpointCore {
         Ok(ConnectionId(id))
     }
     fn connection(&self, id: ConnectionId) -> io::Result<&Connection> {
+        if self.shutdown {
+            return Err(error(io::ErrorKind::ConnectionAborted));
+        }
         let c = self
             .connections
             .get(&id)
@@ -385,6 +406,9 @@ impl EndpointCore {
     /// Processes one session datagram. Over-budget/unknown sessions are silently dropped.
     /// Invalid framing returns InvalidData; never reflect a reset to arbitrary senders.
     pub fn input(&mut self, peer: SocketAddr, packet: &[u8], now: u64) -> io::Result<()> {
+        if self.shutdown {
+            return Err(error(io::ErrorKind::ConnectionAborted));
+        }
         if packet.len() < HEADER
             || packet.len() > self.config.mtu
             || &packet[..4] != MAGIC

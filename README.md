@@ -15,6 +15,8 @@ Enable `async` for `asynchronous::{Endpoint, Connector, KcpStream, Driver}` and
 run the driver concurrently; the library never spawns tasks itself. Clone
 `endpoint.connector()` to initiate multiple connections while the endpoint accepts
 incoming ones; stream operations are woken only when ready or failed.
+`Endpoint::shutdown()` or `Connector::shutdown()` aborts the local endpoint,
+releases its queues, wakes pending operations and lets the driver finish.
 
 ```toml
 [dependencies]

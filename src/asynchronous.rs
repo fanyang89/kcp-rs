@@ -51,6 +51,7 @@ struct Shared {
     accept: Option<Waker>,
     driver: Option<Waker>,
     stopped: Option<io::ErrorKind>,
+    shutdown_requested: bool,
 }
 impl Shared {
     fn check(&self) -> io::Result<()> {
@@ -135,6 +136,7 @@ impl Endpoint {
             accept: None,
             driver: None,
             stopped: None,
+            shutdown_requested: false,
         }));
         Ok((
             Self {
@@ -149,6 +151,12 @@ impl Endpoint {
                 finished: false,
             },
         ))
+    }
+    /// Immediately aborts all local sessions and wakes pending operations with
+    /// ConnectionAborted. The driver returns Ok(()) when next polled. No FIN/RESET
+    /// is sent. For concurrent accept/connect tasks, use Connector::shutdown.
+    pub fn shutdown(&self) {
+        self.connector().shutdown();
     }
     /// A clonable outgoing connection factory, independent of the listener's lifetime.
     pub fn connector(&self) -> Connector {
@@ -201,6 +209,28 @@ pub struct Connector {
     shared: Arc<Mutex<Shared>>,
 }
 impl Connector {
+    /// Permanently shuts down the entire endpoint, including listener and all clones.
+    /// Idempotent; an earlier driver/transport failure keeps its original error.
+    /// This is not graceful stream shutdown. An in-flight transport poll may finish
+    /// concurrently; wait for driver completion before treating I/O as quiescent.
+    pub fn shutdown(&self) {
+        let wakers = {
+            let mut s = self.shared.lock().unwrap();
+            if s.stopped.is_some() {
+                return;
+            }
+            s.shutdown_requested = true;
+            s.stopped = Some(io::ErrorKind::ConnectionAborted);
+            s.core.shutdown();
+            let mut wakers = s.notifications();
+            s.waiters.clear();
+            if let Some(waker) = s.driver.take() {
+                wakers.push(waker);
+            }
+            wakers
+        };
+        wake(wakers);
+    }
     /// Cancellation drops the embryonic stream and releases its connection slot.
     pub async fn connect(&self, peer: SocketAddr) -> io::Result<KcpStream> {
         let (id, waker) = {
@@ -246,7 +276,9 @@ impl KcpStream {
         self.id
     }
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        self.shared.lock().unwrap().core.peer_addr(self.id)
+        let shared = self.shared.lock().unwrap();
+        shared.check()?;
+        shared.core.peer_addr(self.id)
     }
 }
 impl Drop for KcpStream {
@@ -353,7 +385,8 @@ impl AsyncWrite for KcpStream {
 }
 
 /// One cooperative driver per endpoint. Transport/timer failures and dropping this
-/// future wake every pending operation with an error. Does not spawn tasks itself.
+/// future wake every pending operation with an error. Explicit endpoint shutdown
+/// completes this future with Ok(()). Does not spawn tasks itself.
 pub struct Driver<T, C> {
     shared: Arc<Mutex<Shared>>,
     transport: T,
@@ -366,11 +399,16 @@ impl<T, C> Driver<T, C> {
     fn stop(&mut self, kind: io::ErrorKind) {
         let w = {
             let mut s = self.shared.lock().unwrap();
-            s.stopped = Some(kind);
+            s.stopped.get_or_insert(kind);
+            s.core.shutdown();
             s.driver = None;
-            s.notifications()
+            let wakers = s.notifications();
+            s.waiters.clear();
+            wakers
         };
         wake(w);
+        self.pending = None;
+        self.receive = Vec::new();
         self.finished = true;
     }
 }
@@ -386,11 +424,28 @@ impl<T: DatagramTransport + Unpin, C: Timer + Unpin> Future for Driver<T, C> {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
         if this.finished {
-            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+            let s = this.shared.lock().unwrap();
+            return Poll::Ready(if s.shutdown_requested {
+                Ok(())
+            } else {
+                Err(s.stopped.unwrap_or(io::ErrorKind::BrokenPipe).into())
+            });
+        }
+        if this.shared.lock().unwrap().shutdown_requested {
+            this.stop(io::ErrorKind::ConnectionAborted);
+            return Poll::Ready(Ok(()));
         }
         let result = this.poll_inner(cx);
-        if let Poll::Ready(Err(e)) = &result {
-            this.stop(e.kind());
+        if let Poll::Ready(outcome) = &result {
+            this.stop(
+                outcome
+                    .as_ref()
+                    .err()
+                    .map_or(io::ErrorKind::ConnectionAborted, io::Error::kind),
+            );
+            if this.shared.lock().unwrap().shutdown_requested {
+                return Poll::Ready(Ok(()));
+            }
         }
         result
     }
@@ -401,6 +456,13 @@ impl<T: DatagramTransport + Unpin, C: Timer + Unpin> Driver<T, C> {
             let now = self.timer.now();
             let wakers = {
                 let mut s = self.shared.lock().unwrap();
+                if let Some(kind) = s.stopped {
+                    return Poll::Ready(if s.shutdown_requested {
+                        Ok(())
+                    } else {
+                        Err(kind.into())
+                    });
+                }
                 register(&mut s.driver, cx);
                 s.core.update(now);
                 if self.pending.is_none() {
