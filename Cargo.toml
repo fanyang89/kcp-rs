@@ -1,0 +1,8 @@
+[package]
+name = "kcp-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust, runtime-independent KCP protocol implementation"
+license = "MIT"
+
+[dependencies]
