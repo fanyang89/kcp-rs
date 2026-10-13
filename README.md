@@ -140,6 +140,16 @@ KCP checkout. C is used only by this test, never linked into the library:
 KCP_C_SOURCE=/path/to/kcp/ikcp.c cargo test --test c_interop -- --ignored
 ```
 
+The C test runs six configurations: normal/low-latency message mode, congestion
+control enabled/disabled, 50-byte MTU with larger windows, and normal/low-latency
+stream mode (including 256-byte MTU). Each case injects loss, duplicates and
+reordering across a wrapping clock. Both applications pause reads until both
+receive windows close and WASK/WINS probes actually cross the simulated network.
+Reading then resumes; the test requires exact message boundaries (message mode),
+exact concatenated bytes (stream mode), and empty send buffers on **both** peers.
+The C bridge checks full acceptance of writes where the reference API reports a
+byte count. It is compiled once per test and reused across fresh peer processes.
+
 Tests cover bidirectional loss, reordering, duplicates, fragmentation (including
 the maximum message size in C interop), stream mode, zero-window recovery,
 fast retransmission, dead-link detection, malformed packets and timestamp/sequence
