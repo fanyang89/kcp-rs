@@ -81,6 +81,31 @@ struct Segment {
     xmit: u32,
 }
 
+/// Read-only protocol snapshot. Byte counts are payload lengths, not allocation sizes.
+/// Transmission counters count PUSH segment emissions, not successful socket sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KcpStats {
+    pub send_queue_segments: usize,
+    pub unacknowledged_segments: usize,
+    pub pending_send_bytes: usize,
+    pub receive_queue_segments: usize,
+    pub out_of_order_segments: usize,
+    pub buffered_receive_bytes: usize,
+    pub pending_acknowledgements: usize,
+    pub queued_output_datagrams: usize,
+    pub remote_window: u32,
+    /// Congestion window in segments; may be ignored when congestion control is disabled.
+    pub congestion_window: u32,
+    /// None before the first nonnegative RTT sample; Some(0) is a valid measurement.
+    pub smoothed_rtt_ms: Option<u32>,
+    pub retransmission_timeout_ms: u32,
+    /// Lifetime counters saturate at u64::MAX and survive acknowledgement of segments.
+    pub transmissions: u64,
+    pub timeout_retransmissions: u64,
+    pub fast_retransmissions: u64,
+    pub dead: bool,
+}
+
 /// A single KCP conversation, with no sockets, threads, timers or runtime dependencies.
 /// Queues are owned by this object; callers must bound sends and drain output regularly.
 #[derive(Debug)]
@@ -109,6 +134,10 @@ pub struct Kcp {
     probe_wait: u32,
     probe_at: u32,
     dead: bool,
+    transmissions: u64,
+    timeout_retransmissions: u64,
+    fast_retransmissions: u64,
+    rtt_samples: u64,
 }
 impl Kcp {
     pub fn new(conv: u32) -> Self {
@@ -149,7 +178,42 @@ impl Kcp {
             probe_wait: 0,
             probe_at: 0,
             dead: false,
+            transmissions: 0,
+            timeout_retransmissions: 0,
+            fast_retransmissions: 0,
+            rtt_samples: 0,
         })
+    }
+    /// Takes a snapshot without advancing time or consuming queues. O(buffered segments).
+    pub fn stats(&self) -> KcpStats {
+        KcpStats {
+            send_queue_segments: self.send_queue.len(),
+            unacknowledged_segments: self.send_buf.len(),
+            pending_send_bytes: self
+                .send_queue
+                .iter()
+                .chain(&self.send_buf)
+                .map(|s| s.data.len())
+                .sum(),
+            receive_queue_segments: self.recv_queue.len(),
+            out_of_order_segments: self.recv_buf.len(),
+            buffered_receive_bytes: self
+                .recv_queue
+                .iter()
+                .chain(&self.recv_buf)
+                .map(|s| s.data.len())
+                .sum(),
+            pending_acknowledgements: self.acks.len(),
+            queued_output_datagrams: self.output.len(),
+            remote_window: self.remote_window,
+            congestion_window: self.cwnd,
+            smoothed_rtt_ms: (self.rtt_samples != 0).then_some(self.srtt as u32),
+            retransmission_timeout_ms: self.rto,
+            transmissions: self.transmissions,
+            timeout_retransmissions: self.timeout_retransmissions,
+            fast_retransmissions: self.fast_retransmissions,
+            dead: self.dead,
+        }
     }
     pub fn conversation(&self) -> u32 {
         self.conv
@@ -284,6 +348,7 @@ impl Kcp {
                 ACK => {
                     let rtt = diff(now, ts);
                     if rtt >= 0 {
+                        self.rtt_samples = self.rtt_samples.saturating_add(1);
                         let rtt = i64::from(rtt);
                         if self.srtt == 0 {
                             self.srtt = rtt;
@@ -466,6 +531,7 @@ impl Kcp {
                     .wrapping_add(if self.config.nodelay { 0 } else { self.rto / 8 });
                 true
             } else if diff(now, s.resend) >= 0 {
+                self.timeout_retransmissions = self.timeout_retransmissions.saturating_add(1);
                 s.rto = s
                     .rto
                     .saturating_add(if self.config.nodelay {
@@ -481,6 +547,7 @@ impl Kcp {
                 && s.fast >= self.config.fast_resend
                 && s.xmit <= 5
             {
+                self.fast_retransmissions = self.fast_retransmissions.saturating_add(1);
                 s.fast = 0;
                 s.resend = now.wrapping_add(s.rto);
                 change = true;
@@ -489,6 +556,7 @@ impl Kcp {
                 false
             };
             if send {
+                self.transmissions = self.transmissions.saturating_add(1);
                 s.xmit = s.xmit.saturating_add(1);
                 s.ts = now;
                 packets.push(PUSH, s.frg, now, s.sn, &s.data);
@@ -597,5 +665,32 @@ mod tests {
             }
             let _ = kcp.input(&packet, len as u32);
         }
+    }
+
+    #[test]
+    fn transmission_counters_saturate() {
+        let mut kcp = Kcp::with_config(
+            1,
+            Config {
+                congestion_control: false,
+                interval: 10,
+                nodelay: true,
+                fast_resend: 1,
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        kcp.transmissions = u64::MAX;
+        kcp.fast_retransmissions = u64::MAX;
+        kcp.timeout_retransmissions = u64::MAX;
+        kcp.send(b"x").unwrap();
+        kcp.update(0);
+        kcp.send_buf.front_mut().unwrap().fast = 1;
+        kcp.update(10);
+        kcp.update(210);
+        let stats = kcp.stats();
+        assert_eq!(stats.transmissions, u64::MAX);
+        assert_eq!(stats.fast_retransmissions, u64::MAX);
+        assert_eq!(stats.timeout_retransmissions, u64::MAX);
     }
 }

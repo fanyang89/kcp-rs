@@ -669,3 +669,26 @@ fn shutdown_does_not_overwrite_an_earlier_transport_failure() {
         matches!(connect.as_mut().poll(&mut cx),Poll::Ready(Err(e)) if e.kind()==io::ErrorKind::NetworkDown)
     );
 }
+
+#[test]
+fn asynchronous_snapshots_share_endpoint_state_and_reflect_shutdown() {
+    let mut p = Pair::new();
+    let (mut a, _b) = p.streams();
+    let connector = p.a.connector();
+    assert_eq!(p.a.stats(), connector.stats());
+    assert_eq!(connector.stats().established, 1);
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(matches!(
+        Pin::new(&mut a).poll_write(&mut cx, b"abc"),
+        Poll::Ready(Ok(3))
+    ));
+    assert_eq!(a.stats().unwrap().kcp.pending_send_bytes, 4);
+    connector.shutdown();
+    assert!(connector.stats().shutdown);
+    assert_eq!(connector.stats().connections, 0);
+    assert_eq!(connector.stats(), p.a.stats());
+    assert_eq!(
+        a.stats().unwrap_err().kind(),
+        io::ErrorKind::ConnectionAborted
+    );
+}

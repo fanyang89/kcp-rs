@@ -1,5 +1,5 @@
 //! Sans-I/O session management. This versioned protocol is not bare KCP.
-use crate::{Config as KcpConfig, Kcp};
+use crate::{Config as KcpConfig, Kcp, KcpStats};
 use std::{
     collections::{BTreeMap, VecDeque},
     io,
@@ -20,6 +20,49 @@ const RECORD_FIN: u8 = 1;
 /// Local session identifier, never reused during an endpoint's lifetime.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnectionId(pub u64);
+
+/// Session lifecycle state. Half-close is reported separately in ConnectionStats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnectionState {
+    SynSent,
+    SynReceived,
+    Established,
+    Closed,
+    Failed(io::ErrorKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnectionStats {
+    pub id: ConnectionId,
+    pub peer: SocketAddr,
+    pub state: ConnectionState,
+    pub write_closed: bool,
+    pub peer_closed: bool,
+    pub detached: bool,
+    /// Application bytes waiting to be read, excluding KCP's receive buffers.
+    pub buffered_read_bytes: usize,
+    /// Relative to the latest time supplied to the endpoint, not wall-clock sampling time.
+    pub idle_ms: u64,
+    /// Payload lengths include the private session record tag, not the outer envelope.
+    pub kcp: KcpStats,
+}
+
+/// Current gauges, not lifetime counters. Lifecycle counts sum to connections.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EndpointStats {
+    pub connections: usize,
+    pub handshaking: usize,
+    pub established: usize,
+    pub closed: usize,
+    pub failed: usize,
+    pub pending_accepts: usize,
+    pub detached: usize,
+    /// Endpoint output queue only; excludes KCP batches and the driver-owned packet.
+    pub queued_output_datagrams: usize,
+    pub queued_kcp_datagrams: usize,
+    /// True after explicit shutdown or driver termination, including failure/drop.
+    pub shutdown: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -106,6 +149,20 @@ struct Connection {
     detach_deadline: Option<u64>,
 }
 
+impl Connection {
+    fn state(&self) -> ConnectionState {
+        if let Some(kind) = self.error {
+            return ConnectionState::Failed(kind);
+        }
+        match self.phase {
+            Phase::SynSent => ConnectionState::SynSent,
+            Phase::SynReceived => ConnectionState::SynReceived,
+            Phase::Established => ConnectionState::Established,
+            Phase::Closed => ConnectionState::Closed,
+        }
+    }
+}
+
 /// All times are monotonic `u64` milliseconds. No sockets or asynchronous tasks.
 /// Limits bound memory; unauthenticated traffic may still consume CPU and connection slots.
 pub struct EndpointCore {
@@ -170,6 +227,57 @@ impl EndpointCore {
     }
     pub fn is_shutdown(&self) -> bool {
         self.shutdown
+    }
+    /// Read-only O(connections + backlog) snapshot; does not advance protocol state.
+    pub fn stats(&self) -> EndpointStats {
+        let mut stats = EndpointStats {
+            connections: self.connections.len(),
+            queued_output_datagrams: self.output.len(),
+            shutdown: self.shutdown,
+            ..EndpointStats::default()
+        };
+        for c in self.connections.values() {
+            match c.state() {
+                ConnectionState::SynSent | ConnectionState::SynReceived => stats.handshaking += 1,
+                ConnectionState::Established => stats.established += 1,
+                ConnectionState::Closed => stats.closed += 1,
+                ConnectionState::Failed(_) => stats.failed += 1,
+            }
+            stats.detached += usize::from(c.detached);
+            stats.queued_kcp_datagrams += c.kcp.output.len();
+        }
+        stats.pending_accepts = self
+            .accepts
+            .iter()
+            .filter(|id| {
+                self.connections
+                    .get(id)
+                    .is_some_and(|c| c.error.is_none() && !c.accepted)
+            })
+            .count();
+        stats
+    }
+    /// Includes retained failed sessions for diagnostics. Removed/shut-down sessions
+    /// have no snapshot. O(buffered KCP segments), with no queue consumption.
+    pub fn connection_stats(&self, id: ConnectionId) -> io::Result<ConnectionStats> {
+        if self.shutdown {
+            return Err(error(io::ErrorKind::ConnectionAborted));
+        }
+        let c = self
+            .connections
+            .get(&id)
+            .ok_or_else(|| error(io::ErrorKind::NotConnected))?;
+        Ok(ConnectionStats {
+            id,
+            peer: c.peer,
+            state: c.state(),
+            write_closed: c.write_closed,
+            peer_closed: c.peer_closed,
+            detached: c.detached,
+            buffered_read_bytes: c.receive.len(),
+            idle_ms: self.now.saturating_sub(c.last_input),
+            kcp: c.kcp.stats(),
+        })
     }
     /// Most recent monotonic time supplied to the core.
     pub fn current_time(&self) -> u64 {

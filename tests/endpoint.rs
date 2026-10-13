@@ -632,3 +632,63 @@ fn endpoint_shutdown_is_permanent_and_discards_all_protocol_queues() {
     assert_eq!(p.a.connection_count(), 0);
     assert!(p.a.poll_transmit().is_none());
 }
+
+#[test]
+fn endpoint_snapshots_include_terminal_sessions_until_released() {
+    use kcp_rs::endpoint::ConnectionState;
+    let mut core = EndpointCore::new(config(), 1).unwrap();
+    let id = core.connect(addr(2), 0).unwrap();
+    assert_eq!(core.stats().connections, 1);
+    assert_eq!(core.stats().handshaking, 1);
+    assert_eq!(
+        core.connection_stats(id).unwrap().state,
+        ConnectionState::SynSent
+    );
+    core.update(20000);
+    assert_eq!(core.stats().failed, 1);
+    assert_eq!(core.stats().handshaking, 0);
+    let failed = core.connection_stats(id).unwrap();
+    assert_eq!(
+        failed.state,
+        ConnectionState::Failed(io::ErrorKind::TimedOut)
+    );
+    assert_eq!(failed.idle_ms, 20000);
+    core.release(id);
+    assert_eq!(core.stats().connections, 0);
+    assert!(core.connection_stats(id).is_err());
+    core.shutdown();
+    let stopped = core.stats();
+    assert!(stopped.shutdown);
+    assert_eq!(stopped.queued_output_datagrams, 0);
+}
+
+#[test]
+fn connection_snapshots_distinguish_application_buffers_from_kcp_buffers() {
+    use kcp_rs::endpoint::ConnectionState;
+    let mut p = Pair::new();
+    let (a, b) = p.connect(false);
+    assert_eq!(p.a.stats().established, 1);
+    assert_eq!(p.b.stats().pending_accepts, 0);
+    p.a.write(a, b"hello").unwrap();
+    let queued = p.a.connection_stats(a).unwrap();
+    assert_eq!(queued.kcp.pending_send_bytes, 6); // Includes the private DATA tag.
+    assert_eq!(queued.state, ConnectionState::Established);
+    assert_eq!(queued.peer, addr(2));
+    for _ in 0..100 {
+        p.step(false);
+        if p.a.is_flushed(a).unwrap() {
+            break;
+        }
+    }
+    let received = p.b.connection_stats(b).unwrap();
+    assert_eq!(received.buffered_read_bytes, 5);
+    assert_eq!(received.kcp.buffered_receive_bytes, 0);
+    assert_eq!(p.b.connection_stats(b).unwrap(), received);
+    assert_eq!(p.b.read(b, &mut [0; 2]).unwrap(), Some(2));
+    assert_eq!(p.b.connection_stats(b).unwrap().buffered_read_bytes, 3);
+    p.a.close_write(a).unwrap();
+    assert!(p.a.connection_stats(a).unwrap().write_closed);
+    p.a.release(a);
+    assert_eq!(p.a.stats().detached, 1);
+    assert!(p.a.connection_stats(a).unwrap().detached);
+}

@@ -17,6 +17,8 @@ run the driver concurrently; the library never spawns tasks itself. Clone
 incoming ones; stream operations are woken only when ready or failed.
 `Endpoint::shutdown()` or `Connector::shutdown()` aborts the local endpoint,
 releases its queues, wakes pending operations and lets the driver finish.
+Read-only `stats()` snapshots expose queue pressure, lifecycle state, RTT/RTO and
+retransmission counters without a metrics framework or background task.
 
 ```toml
 [dependencies]
@@ -45,6 +47,7 @@ requires matching peers; it does not interoperate with bare KCP or kcp-sys endpo
 - `recv()` takes a complete message (`None` means not ready).
 - `check(now_ms)` returns the next absolute update deadline, valid until a send/input.
 - `waitsnd()` reports queued plus unacknowledged segments for application backpressure.
+- `stats()` provides a non-mutating protocol snapshot for diagnostics.
 
 Both peers must agree on the conversation ID and message/stream mode. The caller
 owns sockets, routing, timers and connection lifecycle. Use Tokio, smol, a custom

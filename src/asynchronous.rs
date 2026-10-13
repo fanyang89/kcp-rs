@@ -1,5 +1,7 @@
 //! Optional runtime-neutral futures-io streams. No implicit spawning or runtime globals.
-use crate::endpoint::{Config, ConnectionId, EndpointCore, Transmit};
+use crate::endpoint::{
+    Config, ConnectionId, ConnectionStats, EndpointCore, EndpointStats, Transmit,
+};
 use futures_io::{AsyncRead, AsyncWrite};
 use std::{
     collections::BTreeMap,
@@ -119,6 +121,11 @@ pub struct Endpoint {
     shared: Arc<Mutex<Shared>>,
 }
 impl Endpoint {
+    /// Snapshot without driving I/O; also available after shutdown/failure.
+    pub fn stats(&self) -> EndpointStats {
+        self.shared.lock().unwrap().core.stats()
+    }
+
     /// Returns the application handle and a driver which the caller must continuously poll.
     pub fn new<T: DatagramTransport + Unpin, C: Timer + Unpin>(
         config: Config,
@@ -209,6 +216,11 @@ pub struct Connector {
     shared: Arc<Mutex<Shared>>,
 }
 impl Connector {
+    /// Snapshot of the shared endpoint, not just connections opened by this clone.
+    pub fn stats(&self) -> EndpointStats {
+        self.shared.lock().unwrap().core.stats()
+    }
+
     /// Permanently shuts down the entire endpoint, including listener and all clones.
     /// Idempotent; an earlier driver/transport failure keeps its original error.
     /// This is not graceful stream shutdown. An in-flight transport poll may finish
@@ -272,6 +284,14 @@ pub struct KcpStream {
     id: ConnectionId,
 }
 impl KcpStream {
+    /// Includes a retained failed session's state. Driver termination releases the
+    /// session and returns the endpoint's terminal error instead of a snapshot.
+    pub fn stats(&self) -> io::Result<ConnectionStats> {
+        let shared = self.shared.lock().unwrap();
+        shared.check()?;
+        shared.core.connection_stats(self.id)
+    }
+
     pub fn id(&self) -> ConnectionId {
         self.id
     }

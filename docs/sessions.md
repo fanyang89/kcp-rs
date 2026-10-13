@@ -215,6 +215,51 @@ finish. Optional keepalive is disabled by default; see below.
 This protocol is **not** the kcp-sys endpoint format and is **not** bare KCP. Both
 peers must implement this session layer; users needing bare KCP should use `Kcp`.
 
+## Read-only diagnostics
+
+No metrics framework or background sampler is required:
+
+- `Kcp::stats()` returns a `KcpStats` snapshot of send/receive queues, buffered
+  payload bytes, deferred ACKs, queued datagrams, remote/congestion windows,
+  smoothed RTT, current RTO, dead-link status and cumulative transmission counters.
+- `EndpointCore::stats()`, `Endpoint::stats()` and `Connector::stats()` report the
+  same endpoint-wide gauges: lifecycle counts, pending accepts, detached sessions,
+  endpoint/KCP output queues and permanent shutdown state.
+- `EndpointCore::connection_stats(id)` and `KcpStream::stats()` include peer address,
+  lifecycle state, half-close/detach flags, application read-buffer size, idle time
+  and the connection's KCP snapshot.
+
+Snapshots do not advance time, consume queues, wake tasks or perform I/O. They are
+owned Copy values; sampling at application-chosen intervals works on any runtime.
+Endpoint sampling scans connections/backlog; KCP and per-connection sampling scan
+buffered segments to sum payload bytes. Async snapshots hold the shared mutex for
+that scan, so avoid unnecessarily frequent sampling of very large endpoints.
+
+Counter/queue semantics matter:
+
+- `transmissions` counts PUSH segment emissions, including retransmissions, when
+  KCP generates output. It excludes ACK/WASK/WINS and is **not** a UDP packet or
+  successful socket-send count. One datagram may contain multiple segments, and
+  generated datagrams may still be queued at the transport.
+- Timeout and fast-retransmission counters are separate, cumulative for the KCP
+  object's lifetime and retained after ACKs remove segments. Counters saturate at
+  u64::MAX instead of wrapping; gauges are current sizes, not historical totals.
+- Payload byte counts exclude KCP headers and allocation capacity. In the session
+  layer they include private DATA/FIN record tags. `buffered_read_bytes` counts only
+  application bytes already moved out of KCP; inspect both queues for receive pressure.
+- Endpoint output gauges exclude the one datagram currently owned by the driver.
+- RTT is `None` before a sample, and `Some(0)` for a measured zero-millisecond RTT.
+  RTO is KCP's base estimate; an individual segment may have a backed-off timeout.
+- `idle_ms` uses the latest time supplied to the endpoint, not the instant at which
+  the snapshot is requested. Congestion window may be ignored by configuration.
+
+A retained failed connection reports `ConnectionState::Failed(error_kind)` instead
+of hiding its diagnostic state. Once released or removed, that snapshot is no
+longer available. Driver termination releases connection buffers, so stream stats
+then return its terminal error. Endpoint stats remain available and show shutdown
+with empty queues; that flag alone does not distinguish explicit shutdown from
+transport failure (use the driver result/operation error for the cause).
+
 ## Optional idle keepalive
 
 ```rust
