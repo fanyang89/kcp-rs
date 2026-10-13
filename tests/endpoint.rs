@@ -436,3 +436,158 @@ fn readiness_tracks_data_capacity_eof_and_errors() {
         io::ErrorKind::ConnectionReset
     );
 }
+
+fn keep_alive_pair(client: bool, server: bool) -> Pair {
+    let mut p = Pair::new();
+    let config = Config {
+        idle_timeout: 500,
+        close_timeout: 200,
+        keep_alive_interval: Some(50),
+        ..config()
+    };
+    p.a = EndpointCore::new(
+        Config {
+            keep_alive_interval: client.then_some(50),
+            ..config.clone()
+        },
+        100,
+    )
+    .unwrap();
+    p.b = EndpointCore::new(
+        Config {
+            keep_alive_interval: server.then_some(50),
+            ..config
+        },
+        200,
+    )
+    .unwrap();
+    p
+}
+
+#[test]
+fn optional_keep_alive_survives_idle_loss_and_timestamp_wrap() {
+    // One-sided probing is sufficient: the other peer responds with ordinary WINS.
+    for (client, server) in [(true, false), (false, true), (true, true)] {
+        let mut p = keep_alive_pair(client, server);
+        p.now = u64::from(u32::MAX) - 100;
+        let (a, b) = p.connect(false);
+        for _ in 0..1000 {
+            p.step(true);
+        }
+        assert!(p.a.is_connected(a).unwrap());
+        assert!(p.b.is_connected(b).unwrap());
+        assert_eq!(p.a.read(a, &mut [0; 1]).unwrap(), None);
+        assert_eq!(p.b.read(b, &mut [0; 1]).unwrap(), None);
+        assert!(p.a.is_flushed(a).unwrap());
+        assert!(p.b.is_flushed(b).unwrap());
+    }
+}
+
+#[test]
+fn disabled_keep_alive_still_expires_idle_connections() {
+    let mut p = keep_alive_pair(false, false);
+    let (a, b) = p.connect(false);
+    for _ in 0..100 {
+        p.step(false);
+    }
+    assert_eq!(
+        p.a.is_connected(a).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(
+        p.b.is_connected(b).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn sending_probes_without_replies_does_not_extend_idle_timeout() {
+    let mut p = keep_alive_pair(true, false);
+    let (a, _) = p.connect(false);
+    let start = p.now;
+    let mut probes = 0;
+    while p.now < start + 600 {
+        p.now += 10;
+        p.a.update(p.now);
+        while let Some(packet) = p.a.poll_transmit() {
+            assert_eq!(packet.payload[5], 4);
+            assert_eq!(packet.payload.len(), 22 + 24);
+            assert_eq!(packet.payload[22 + 4], 83); // KCP WASK, no application record.
+            probes += 1;
+        }
+        assert!(p.a.deadline().is_none_or(|deadline| deadline > p.now));
+    }
+    assert!(probes >= 2);
+    assert_eq!(
+        p.a.is_connected(a).unwrap_err().kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+#[test]
+fn probes_preserve_half_close_but_do_not_prevent_detached_cleanup() {
+    let mut p = keep_alive_pair(true, true);
+    let (a, b) = p.connect(false);
+    assert!(p.a.close_write(a).unwrap());
+    for _ in 0..100 {
+        p.step(false);
+    }
+    assert!(p.a.is_flushed(a).unwrap());
+    assert_eq!(p.b.read(b, &mut [0; 1]).unwrap(), Some(0));
+    // An acknowledged half-close is still readable after close_timeout.
+    assert_eq!(p.b.write(b, b"reply").unwrap(), Some(5));
+    for _ in 0..20 {
+        p.step(false);
+    }
+    let mut reply = [0; 5];
+    assert_eq!(p.a.read(a, &mut reply).unwrap(), Some(5));
+    assert_eq!(&reply, b"reply");
+    p.a.release(a);
+    // The peer continues to respond/probe, but an abandoned handle has a fixed budget.
+    for _ in 0..30 {
+        p.step(false);
+    }
+    assert_eq!(p.a.connection_count(), 0);
+}
+
+#[test]
+fn keep_alive_does_not_extend_graceful_linger() {
+    let mut p = keep_alive_pair(true, true);
+    let (a, b) = p.connect(false);
+    assert!(p.a.close_write(a).unwrap());
+    assert!(p.b.close_write(b).unwrap());
+    p.a.release(a);
+    p.b.release(b);
+    for _ in 0..100 {
+        p.step(false);
+    }
+    assert_eq!(p.a.connection_count() + p.b.connection_count(), 0);
+}
+
+#[test]
+fn keep_alive_configuration_requires_a_sensible_interval() {
+    for interval in [0, 1, 9, 500, 1000] {
+        assert!(
+            EndpointCore::new(
+                Config {
+                    idle_timeout: 500,
+                    keep_alive_interval: Some(interval),
+                    ..config()
+                },
+                1
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        EndpointCore::new(
+            Config {
+                idle_timeout: 500,
+                keep_alive_interval: Some(10),
+                ..config()
+            },
+            1
+        )
+        .is_ok()
+    );
+}

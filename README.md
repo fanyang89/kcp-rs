@@ -8,7 +8,8 @@ It uses `std` for owned buffers and queues. An optional `async` feature adds onl
 ## Connections and asynchronous streams
 
 `endpoint::EndpointCore` adds bounded connection management, handshake retries,
-session routing, timeouts and reliable half-close without asynchronous dependencies.
+session routing, timeouts, optional idle keepalive and reliable half-close without
+asynchronous dependencies.
 Enable `async` for `asynchronous::{Endpoint, Connector, KcpStream, Driver}` and
 `futures_io::AsyncRead` / `AsyncWrite`. Supply a datagram transport and timer and
 run the driver concurrently; the library never spawns tasks itself. Clone

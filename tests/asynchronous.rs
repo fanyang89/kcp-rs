@@ -113,6 +113,14 @@ struct Pair {
 }
 impl Pair {
     fn new() -> Self {
+        Self::with_config(Config {
+            send_capacity: 2,
+            receive_capacity: 1400,
+            output_capacity: 2,
+            ..Config::default()
+        })
+    }
+    fn with_config(config: Config) -> Self {
         let left = Arc::new(Mutex::new(Inbox::default()));
         let right = Arc::new(Mutex::new(Inbox::default()));
         let blocked = Arc::new(AtomicBool::new(false));
@@ -133,12 +141,6 @@ impl Pair {
             blocked: Arc::default(),
             writer: Arc::default(),
             fail: Arc::default(),
-        };
-        let config = Config {
-            send_capacity: 2,
-            receive_capacity: 1400,
-            output_capacity: 2,
-            ..Config::default()
         };
         let (a, da) = Endpoint::new(config.clone(), 1, t1, Clock(time.clone())).unwrap();
         let (b, db) = Endpoint::new(config, 100, t2, Clock(time.clone())).unwrap();
@@ -526,4 +528,35 @@ fn connector_survives_listener_drop_and_observes_driver_drop() {
     assert!(
         matches!(connection.as_mut().poll(&mut cx), Poll::Ready(Err(e)) if e.kind() == io::ErrorKind::BrokenPipe)
     );
+}
+
+#[test]
+fn keep_alive_is_invisible_to_pending_stream_reads() {
+    let mut p = Pair::with_config(Config {
+        idle_timeout: 500,
+        keep_alive_interval: Some(50),
+        ..Config::default()
+    });
+    let (mut a, _b) = p.streams();
+    let counter = Arc::new(Counter::default());
+    let w = Waker::from(counter.clone());
+    let mut cx = Context::from_waker(&w);
+    assert!(
+        Pin::new(&mut a)
+            .poll_read(&mut cx, &mut [0; 1])
+            .is_pending()
+    );
+    for _ in 0..1000 {
+        p.step();
+    }
+    assert_eq!(counter.0.load(Ordering::SeqCst), 0);
+    assert!(
+        Pin::new(&mut a)
+            .poll_read(&mut cx, &mut [0; 1])
+            .is_pending()
+    );
+    assert!(matches!(
+        Pin::new(&mut a).poll_write(&mut cx, b"still alive"),
+        Poll::Ready(Ok(11))
+    ));
 }

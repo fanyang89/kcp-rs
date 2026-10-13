@@ -36,6 +36,10 @@ pub struct Config {
     pub output_capacity: usize,
     pub handshake_timeout: u64,
     pub idle_timeout: u64,
+    /// Optional idle probe interval in milliseconds, using KCP WASK/WINS.
+    /// Must be at least the KCP update interval and less than idle_timeout.
+    /// Disabled by default. Only received traffic, never probes sent, refreshes liveness.
+    pub keep_alive_interval: Option<u64>,
     pub close_timeout: u64,
     /// Keep acknowledging retransmissions after both halves close.
     pub linger: u64,
@@ -58,6 +62,7 @@ impl Default for Config {
             output_capacity: 256,
             handshake_timeout: 10_000,
             idle_timeout: 120_000,
+            keep_alive_interval: None,
             close_timeout: 30_000,
             linger: 5_000,
         }
@@ -86,6 +91,7 @@ struct Connection {
     created: u64,
     deferred_start: bool,
     last_input: u64,
+    last_probe: u64,
     retry_at: u64,
     retry_delay: u64,
     receive: VecDeque<u8>,
@@ -97,6 +103,7 @@ struct Connection {
     incoming: bool,
     accepted: bool,
     detached: bool,
+    detach_deadline: Option<u64>,
 }
 
 /// All times are monotonic `u64` milliseconds. No sockets or asynchronous tasks.
@@ -126,6 +133,11 @@ impl EndpointCore {
             || session_seed == 0
             || config.handshake_timeout == 0
             || config.idle_timeout == 0
+            || config.keep_alive_interval.is_some_and(|interval| {
+                interval == 0
+                    || interval < u64::from(config.kcp.interval)
+                    || interval >= config.idle_timeout
+            })
             || config.close_timeout == 0
             || config.linger == 0
         {
@@ -192,6 +204,7 @@ impl EndpointCore {
             created: self.now,
             deferred_start: false,
             last_input: self.now,
+            last_probe: self.now,
             retry_at: self.now,
             retry_delay: 200,
             receive: VecDeque::new(),
@@ -203,6 +216,7 @@ impl EndpointCore {
             incoming: phase == Phase::SynReceived,
             accepted: false,
             detached: false,
+            detach_deadline: None,
         }
     }
     /// Starts an outgoing handshake. Call `update` to produce packets.
@@ -340,6 +354,8 @@ impl EndpointCore {
             } else {
                 c.receive.clear();
                 c.detached = true;
+                c.detach_deadline
+                    .get_or_insert(self.now.saturating_add(self.config.close_timeout));
             }
             return;
         }
@@ -525,8 +541,18 @@ impl EndpointCore {
                         }
                     }
                 }
-                // Never accumulate multiple flushes behind an undrained output batch.
+                // WASK/WINS are understood by existing KCP peers. Probes do not consume
+                // application send slots and never extend the receive-based idle deadline.
                 if c.kcp.output.is_empty() {
+                    if !c.detached
+                        && !(c.write_closed && c.peer_closed)
+                        && let Some(interval) = self.config.keep_alive_interval
+                        && now >= c.last_input.max(c.last_probe).saturating_add(interval)
+                    {
+                        c.kcp.probe |= 1;
+                        c.last_probe = now;
+                    }
+                    // Never accumulate multiple flushes behind an undrained output batch.
                     c.kcp.update(now as u32);
                 }
                 if c.kcp.is_dead() {
@@ -543,6 +569,7 @@ impl EndpointCore {
                         }
                     }
                 } else if now.saturating_sub(c.last_input) >= self.config.idle_timeout
+                    || c.detach_deadline.is_some_and(|deadline| now >= deadline)
                     || (c.kcp.waitsnd() != 0
                         && c.close_started.is_some_and(|start| {
                             now.saturating_sub(start) >= self.config.close_timeout
@@ -605,6 +632,16 @@ impl EndpointCore {
                         at = at.min(until);
                     } else {
                         at = at.min(c.last_input.saturating_add(self.config.idle_timeout));
+                        if let Some(deadline) = c.detach_deadline {
+                            at = at.min(deadline);
+                        }
+                        if !c.detached
+                            && !(c.write_closed && c.peer_closed)
+                            && c.kcp.output.is_empty()
+                            && let Some(interval) = self.config.keep_alive_interval
+                        {
+                            at = at.min(c.last_input.max(c.last_probe).saturating_add(interval));
+                        }
                         if c.kcp.waitsnd() != 0
                             && let Some(start) = c.close_started
                         {

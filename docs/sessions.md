@@ -86,7 +86,9 @@ Connector to move it into another task without transferring listener ownership.
 - Dropping a stream without starting graceful close aborts and queues a best-effort
   RESET. After close has started, dropping detaches the stream: the driver continues
   retransmission/ACKs, discards further read data and reclaims it after completion
-  and linger, or timeout. Drop is never an asynchronous graceful-close guarantee.
+  and linger, or timeout. A detached stream waiting for the peer's FIN has an
+  additional fixed `close_timeout` budget starting at release, even if traffic
+  or keepalive continues. Drop is never an asynchronous graceful-close guarantee.
 - Dropping the driver wakes pending connect/accept/read/write/flush/close operations
   with BrokenPipe. Transport/timer failure propagates its error kind to all handles.
   Cancellation of the driver does not gracefully close remote sessions.
@@ -175,10 +177,40 @@ Once both FINs are processed and local sends are ACKed, the endpoint continues
 ACKing duplicates for `linger` milliseconds (default 5 seconds). No finite linger
 can guarantee delivery through an arbitrarily long outage. Tune it for expected
 RTT/loss conditions. Idle timeout (default 120 seconds) applies before both halves
-finish; there is no automatic keepalive in this version.
+finish. Optional keepalive is disabled by default; see below.
 
 This protocol is **not** the kcp-sys endpoint format and is **not** bare KCP. Both
 peers must implement this session layer; users needing bare KCP should use `Kcp`.
+
+## Optional idle keepalive
+
+```rust
+let config = kcp_rs::endpoint::Config {
+    keep_alive_interval: Some(15_000),
+    idle_timeout: 120_000,
+    ..Default::default()
+};
+```
+
+An established connection with no recent valid inbound traffic queues an ordinary
+KCP WASK window probe; the peer responds with WINS through the normal KCP machinery.
+This adds no session packet types, negotiation or wire format changes, and needs no
+runtime-specific timer. One side may enable probing while the other leaves it off.
+Probes do not consume application send slots, produce stream bytes or wake idle
+application readers. Ongoing inbound traffic suppresses redundant idle probes.
+
+The interval must be at least `config.kcp.interval` and strictly below
+`idle_timeout`; allow substantial additional margin for RTT, loss and scheduling
+on **both** peers. The configured interval is a scheduling target, not a delivery
+promise: KCP flush timing and blocked output may delay transmission. Only valid
+received packets refresh the idle deadline. Sending unanswered probes cannot keep
+a dead peer alive indefinitely. This is liveness detection, not authenticated
+proof of peer identity or anti-replay protection.
+
+Acknowledged half-closed streams remain eligible for keepalive while the read half
+is open. Locally detached handles stop initiating probes and have a fixed cleanup
+budget; remote probes cannot retain an abandoned connection forever. Once both
+halves finish, keepalive stops and never extends the normal linger deadline.
 
 ## Security and scope
 
@@ -186,7 +218,7 @@ The protocol is experimental, unauthenticated and unencrypted. Session IDs do no
 prevent on-path injection; the initial seed is not a cryptographic handshake. An
 attacker can consume the configured backlog or forge packets when identifiers are
 known. There are no stateless cookies, authentication, NAT traversal, migration,
-keepalive, version negotiation or congestion-control plugins. Deploy over an
+version negotiation or congestion-control plugins. Deploy over an
 appropriate authenticated transport or restrict peers and apply external admission
 controls. The code has not received a production security audit or performance tuning.
 
@@ -207,6 +239,7 @@ and exchange a response. They use the same stream API and differ only in UDP/tim
 adapters and executor. Deterministic tests additionally exercise each lost handshake
 leg, loss/reordering/duplication, multiple connections, backpressure, FIN ordering,
 lingering cleanup, malformed input, timeout/reset, concurrent bidirectional opens,
-connector/listener ownership, cancellation, readiness-specific wakeups and driver
+connector/listener ownership, keepalive through loss/timestamp wrap, unanswered-probe
+expiry, detached cleanup, cancellation, readiness-specific wakeups and driver
 shutdown behavior. Tokio users wanting Tokio I/O traits can wrap a KcpStream with
 `tokio-util::compat::FuturesAsyncReadCompatExt::compat()` in their own application.
