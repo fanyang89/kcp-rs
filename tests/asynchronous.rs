@@ -692,3 +692,37 @@ fn asynchronous_snapshots_share_endpoint_state_and_reflect_shutdown() {
         io::ErrorKind::ConnectionAborted
     );
 }
+
+#[test]
+fn unaligned_retransmission_does_not_spin_the_driver() {
+    let mut p = Pair::with_config(Config {
+        kcp: kcp_rs::Config {
+            interval: 30,
+            nodelay: true,
+            congestion_control: false,
+            ..Default::default()
+        },
+        ..Config::default()
+    });
+    let (mut a, _b) = p.streams();
+    let counter = Arc::new(Counter::default());
+    let w = Waker::from(counter.clone());
+    let mut cx = Context::from_waker(&w);
+    assert!(matches!(
+        Pin::new(&mut a).poll_write(&mut cx, b"lost"),
+        Poll::Ready(Ok(4))
+    ));
+    // Stop driving B, so A receives no ACK. Poll around every millisecond of the
+    // non-aligned RTO, rather than hiding an immediate-deadline loop with 10 ms ticks.
+    for _ in 0..600 {
+        let now = p.time.fetch_add(1, Ordering::SeqCst) + 1;
+        counter.0.store(0, Ordering::SeqCst);
+        assert!(Pin::new(&mut p.da).poll(&mut cx).is_pending());
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            0,
+            "driver self-woke without progress at {now} ms"
+        );
+    }
+    assert!(a.stats().unwrap().kcp.timeout_retransmissions > 0);
+}

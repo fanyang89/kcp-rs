@@ -79,6 +79,9 @@ more. Supply current time to `input` for RTT estimation. Call `update` initially
 after handling events, and at the deadline from `check`. After send/input,
 recompute the deadline; `flush` can force immediate output after initialization.
 For a timer duration use `deadline.wrapping_sub(now)` after calling `check(now)`.
+`check` returns an actionable flush deadline: a segment RTO falling between update
+ticks does not cause an earlier wake that `update` cannot service. Retransmissions
+still run on the configured flush interval; use `flush` for explicit immediate output.
 
 Drain output promptly. If a socket would block, retain the taken datagram in your
 transport adapter and retry it. Draining output is not acknowledgement of delivery;

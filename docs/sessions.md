@@ -140,6 +140,12 @@ Call `update` after input/application actions and at `deadline()`. Drain
 If transport is blocked, keep the taken datagram and wait for writability; do not
 poll in a tight loop. The async driver implements this contract.
 
+KCP retransmissions are serviced on flush ticks. `Kcp::check()` schedules the next
+actual flush, not an earlier per-segment RTO which `update()` cannot yet service.
+For example, with 30 ms updates and a 200 ms RTO, the next actionable deadline
+following 180 ms is 210 ms, not 200 ms. This prevents an expired-deadline self-wake
+loop without changing the configured retransmission/flush behavior or wire format.
+
 Endpoint limits include total connections, incoming unaccepted backlog, queued
 output datagrams, per-connection unacknowledged/queued send segments, and application
 receive bytes. Backlog includes half-open sessions. Invalid or over-budget network

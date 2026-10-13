@@ -454,21 +454,16 @@ impl Kcp {
             self.flush();
         }
     }
-    /// Absolute wrapping timestamp for the next update, valid until the next send/input.
+    /// Absolute wrapping timestamp for the next actionable update, valid until the
+    /// next send/input. Retransmissions run on flush ticks, not independent RTO timers.
     pub fn check(&self, now: u32) -> u32 {
         let delta = diff(self.next_flush, now);
         if !self.updated || delta <= 0 || delta > 10000 {
             return now;
         }
-        let mut wait = (delta as u32).min(self.config.interval);
-        for s in &self.send_buf {
-            let d = diff(s.resend, now);
-            if d <= 0 {
-                return now;
-            }
-            wait = wait.min(d as u32);
-        }
-        now.wrapping_add(wait)
+        // update() cannot flush before next_flush. Returning an earlier segment RTO
+        // would leave that deadline expired after update(), causing a timer busy loop.
+        self.next_flush
     }
     /// Flushes immediately using the latest supplied time; no-op before the first update.
     pub fn flush(&mut self) {

@@ -288,3 +288,71 @@ fn timeout_statistics_survive_acknowledgement() {
     assert_eq!(a.stats().timeout_retransmissions, 1);
     assert_eq!(a.stats().smoothed_rtt_ms, Some(210));
 }
+
+#[test]
+fn check_deadline_is_actionable_when_rto_falls_between_flush_ticks() {
+    let mut kcp = Kcp::with_config(
+        7,
+        Config {
+            interval: 30,
+            ..fast()
+        },
+    )
+    .unwrap();
+    kcp.send(b"unacknowledged").unwrap();
+    for now in (0..=180).step_by(30) {
+        kcp.update(now);
+    }
+    let deadline = kcp.check(180);
+    kcp.update(deadline);
+    let next = kcp.check(deadline);
+    assert!(
+        next.wrapping_sub(deadline) > 0,
+        "update at {deadline} left the same expired deadline"
+    );
+    assert_eq!(kcp.stats().timeout_retransmissions, 1);
+}
+
+#[test]
+fn timer_only_driving_makes_progress_across_intervals_and_clock_wrap() {
+    for interval in [10, 17, 30, 100, 5000] {
+        for nodelay in [false, true] {
+            for start in [0, u32::MAX - 50] {
+                let mut kcp = Kcp::with_config(
+                    7,
+                    Config {
+                        interval,
+                        nodelay,
+                        ..fast()
+                    },
+                )
+                .unwrap();
+                kcp.send(b"unacknowledged").unwrap();
+                let mut now = start;
+                for _ in 0..100 {
+                    kcp.update(now);
+                    while kcp.poll_output().is_some() {}
+                    let next = kcp.check(now);
+                    let wait = next.wrapping_sub(now);
+                    assert_eq!(
+                        wait, interval,
+                        "interval={interval}, nodelay={nodelay}, start={start}"
+                    );
+                    assert_eq!(kcp.check(now.wrapping_add(wait - 1)), next);
+                    now = next;
+                }
+                assert!(kcp.stats().timeout_retransmissions > 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn check_and_update_recover_from_large_clock_discontinuities() {
+    let mut kcp = Kcp::with_config(7, fast()).unwrap();
+    for now in [0, 100000, 0, u32::MAX - 100000, 100000] {
+        assert_eq!(kcp.check(now), now);
+        kcp.update(now);
+        assert_eq!(kcp.check(now).wrapping_sub(now), 10);
+    }
+}
