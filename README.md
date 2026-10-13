@@ -31,7 +31,9 @@ cargo run --features async --example async_io
 ```
 
 Both adapters use the same stream API and verify a 256 KiB UDP transfer and
-bidirectional half-close. Runtimes are dev/example dependencies only.
+bidirectional half-close. Automated runtime tests additionally run concurrent
+connections with applications and drivers independently scheduled, including
+spawned-driver cancellation. Runtimes are dev/example dependencies only.
 See [sessions and async integration](docs/sessions.md) for budgets, lifecycle,
 wire format, cancellation and security limitations. The new session protocol
 requires matching peers; it does not interoperate with bare KCP or kcp-sys endpoints.
@@ -125,6 +127,7 @@ endpoint/connection protocol.
 cargo test
 cargo test --release
 cargo test --all-features
+cargo test --features async --test runtimes
 cargo test --all-features --release
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check

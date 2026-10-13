@@ -312,6 +312,7 @@ controls. The code has not received a production security audit or performance t
 cargo run --features async --example tokio
 cargo run --features async --example async_io
 cargo test --all-features
+cargo test --features async --test runtimes
 cargo test --all-features --release
 cargo clippy --all-targets --all-features -- -D warnings
 cargo tree --edges normal --no-default-features
@@ -320,7 +321,21 @@ cargo tree --edges normal --features async
 
 Both examples transfer 256 KiB over real loopback UDP, verify the bytes, half-close
 and exchange a response. They use the same stream API and differ only in UDP/timer
-adapters and executor. Deterministic tests additionally exercise each lost handshake
+adapters and executor.
+The adapter implementations in `examples/support/{tokio,async_io}.rs` are also used
+by `tests/runtimes.rs`; this is development-only sharing, not runtime dependencies
+or a public adapter API in the library.
+
+The runtime integration tests use independent Tokio tasks and independent
+futures-lite executors on scoped threads with the async-io reactor. They verify
+four concurrent connections over real loopback UDP with two-segment send budgets,
+small receive/output buffers, 32 KiB payloads, explicit flush, bidirectional
+half-close and driver completion after endpoint shutdown. A separate Tokio test
+aborts a spawned driver only after a reader task has registered Pending, then
+verifies that reader wakes with BrokenPipe. These tests do not manually poll the
+driver or advance a fake clock, so they exercise real socket/timer waker wiring.
+Timeouts bound failure paths; RAII shutdown releases the test endpoints on errors.
+ Deterministic tests additionally exercise each lost handshake
 leg, loss/reordering/duplication, multiple connections, backpressure, FIN ordering,
 lingering cleanup, malformed input, timeout/reset, concurrent bidirectional opens,
 connector/listener ownership, keepalive through loss/timestamp wrap, unanswered-probe
